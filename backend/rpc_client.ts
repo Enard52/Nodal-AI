@@ -29,6 +29,7 @@ import { createLogger } from './utils/logger';
 import { isThrottled, handleRateLimitResponse, withBackoffGuard } from './network';
 export { withBackoffGuard } from './network';
 import { withSpan } from './telemetry';
+import { alertBreakerOpen } from './alerts';
 
 const log = createLogger('rpc-client');
 // Exported so the breaker's behaviour can be asserted against the real
@@ -114,6 +115,10 @@ export function attachBreakerTelemetry<TArgs extends unknown[], TResult>(
       },
       'RPC circuit opened'
     );
+    alertBreakerOpen(name, {
+      failures: breaker.stats.failures,
+      successes: breaker.stats.successes,
+    });
   });
 
   breaker.on('halfOpen', () => {

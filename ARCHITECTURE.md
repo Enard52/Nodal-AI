@@ -216,6 +216,10 @@ Every `TaskType` value accepted by `PayFiAgent.run()` is listed below, together 
 | `soroban_event_query` | `SorobanEventIndexerTool` | Query historical Soroban contract events by ledger range and topic filters. Read-only. |
 | `stellar_identity_auth` | `StellarIdentityTool` | Perform SEP-0010 Web Auth challenge-response authentication with an anchor and obtain a JWT. |
 | `friendbot` | `FriendBotTool` | Request test account funding on testnet or futurenet via Friendbot. Not available on mainnet. |
+| `ledger_info` | `LedgerInfoTool` | Fetch the latest ledger sequence and protocol version from Soroban RPC. Cached for 6 seconds unless `forceRefresh: true`. Read-only. |
+| `network_status` | `NetworkStatusTool` | Check health and latency of the configured Horizon and Soroban RPC endpoints. Read-only. |
+| `offer_book` | `OfferBookTool` | Query the Stellar DEX order book for an asset pair and return bids, asks, and the top-of-book spread. Read-only. |
+| `soroban_storage` | `SorobanStorageTool` | Read a Soroban contract's storage entry (`persistent`, `temporary`, or `instance`) and return the decoded value. Read-only. |
 
 ### Lifecycle Hooks
 

@@ -6,6 +6,7 @@
 #   agent               — Nodal AI backend (connects to quickstart)
 #   test-runner         — full-stack integration tests (profile: test)
 #   test-runner-only    — tests against quickstart only, no agent (profile: test-only)
+#   jaeger              — trace UI + OTLP collector (profile: observability)
 #
 # Usage:
 #   docker compose up --build          # start everything
@@ -14,6 +15,10 @@
 #   docker compose --profile test up --build         # full stack + tests (needs agent healthy)
 #   docker compose --profile test-only up --build --abort-on-container-exit --exit-code-from test-runner-only
 #     # tests only against stellar-quickstart, skips booting the agent HTTP server
+#   docker compose --profile test-only up -d --wait stellar-quickstart  # then run E2E tests
+#     # on the host — see tests/e2e/escrow_flow.test.ts and .github/workflows/e2e.yml
+#   OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile observability up --build
+#     # exports agent.executeTask → tool.<task_type> → RPC spans; open http://localhost:16686
 # =============================================================================
 
 version: "3.9"
@@ -66,6 +71,10 @@ services:
       MAX_RETRIES:        ${MAX_RETRIES:-3}
       RETRY_DELAY_MS:     ${RETRY_DELAY_MS:-1500}
       NODE_ENV:           production
+      # Passed through only when set on the host (an empty value would fail
+      # config validation). Point at http://jaeger:4318 to trace into Jaeger.
+      OTLP_ENDPOINT:
+      OTEL_REDACT_TX_HASH:
     ports:
       - "3000:3000"
     healthcheck:
@@ -142,6 +151,23 @@ services:
       RETRY_DELAY_MS:     "100"
     command: npm run test:ts
     restart: "no"
+    networks:
+      - nodal-net
+
+  # ── Jaeger (trace UI + OTLP receiver, not started by default) ───────────────
+  # Shows the agent.executeTask → tool.<task_type> span hierarchy, searchable by
+  # the nodal.correlation_id tag. Start with:
+  #   OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile observability up
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: nodal-jaeger
+    profiles:
+      - observability
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"            # Jaeger UI
+      - "4318:4318"              # OTLP HTTP
     networks:
       - nodal-net
 

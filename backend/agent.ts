@@ -58,6 +58,8 @@ import { spendingTracker } from './spending_tracker';
 import { dispatchWebhook } from './webhook';
 import { createAgentSigner, Signer } from './signer';
 import { isPaused } from './kill_switch';
+import { withSpan, markSpanError, setTxHashAttribute, SPAN_ATTR } from './telemetry';
+import { failureAlerts } from './alerts';
 
 // Re-exported so existing importers (`server.ts`, tests) keep working after the
 // singleton moved to spending_tracker.ts.
@@ -1021,7 +1023,16 @@ export class PayFiAgent extends EventEmitter {
           assertWithinSpendingLimit,
         };
         const input = tool.inputSchema.parse(task.payload);
-        const data: unknown = await tool.execute(input, ctx);
+        // Child span of agent.executeTask (#823) so per-tool latency is visible.
+        const data: unknown = await withSpan(
+          `tool.${task.type}`,
+          async (span) => {
+            const toolData: unknown = await tool.execute(input, ctx);
+            setTxHashAttribute(span, toolData);
+            return toolData;
+          },
+          { [SPAN_ATTR.TASK_TYPE]: task.type, [SPAN_ATTR.CORRELATION_ID]: correlationId }
+        );
 
         taskLog.info({ taskType: task.type }, 'Task completed');
         const result: AgentResult = { success: true, taskType: task.type, data, correlationId };
@@ -1079,8 +1090,29 @@ export class PayFiAgent extends EventEmitter {
     }
 
     try {
-      return await chain();
+      // Root span for the task (#823): tool spans and RPC spans nest under it,
+      // and the correlation ID links the trace to the task's log lines.
+      const result = await withSpan(
+        'agent.executeTask',
+        async (span) => {
+          const taskResult = await chain();
+          if (taskResult.success) {
+            setTxHashAttribute(span, taskResult.data);
+          } else {
+            markSpanError(span, taskResult.error ?? 'Task failed');
+          }
+          return taskResult;
+        },
+        { [SPAN_ATTR.TASK_TYPE]: task.type, [SPAN_ATTR.CORRELATION_ID]: correlationId }
+      );
+      if (result.success) {
+        failureAlerts.recordSuccess();
+      } else {
+        failureAlerts.recordFailure(task.type);
+      }
+      return result;
     } catch (err) {
+      failureAlerts.recordFailure(task.type);
       const durationMs = Date.now() - startMs;
       const safe = redactSecretString(describeError(err));
       const sanitized = sanitizePayload(task.payload);
