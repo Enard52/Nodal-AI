@@ -72,16 +72,22 @@ export class SpendingTracker {
         timestamp: r.timestamp,
       }));
       if (this.records.length > 0) {
-        logger.info('Restored spending window from persistence', {
-          records: this.records.length,
-          total: this.total(),
-        });
+        logger.info(
+          {
+            records: this.records.length,
+            total: this.total(),
+          },
+          'Restored spending window from persistence'
+        );
       }
     } catch (err) {
       // No database, or it is unreadable — carry on with an empty window.
-      logger.warn('Could not restore spending window; starting empty', {
-        error: String(err),
-      });
+      logger.warn(
+        {
+          error: String(err),
+        },
+        'Could not restore spending window; starting empty'
+      );
       this.records = [];
     }
   }
@@ -159,7 +165,55 @@ export class SpendingTracker {
     const now = Date.now();
     this.pruneOld(now);
 
-    this.assertWithinLimit(amount);
+    const prospective = this.sumCommitted() + this.sumReserved() + amount;
+    const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+    if (!isNaN(prospective) && !isNaN(limit) && prospective > limit) {
+      throw new Error(`Cumulative spending ${prospective} exceeds limit ${limit}`);
+    this.persist({ amount, timestamp: now });
+    const total = this.total();
+    const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+    if (!isNaN(total) && !isNaN(limit)) {
+      if (total > limit * 0.8) {
+        logger.warn(
+          {
+            total,
+            limit,
+            percent: ((total / limit) * 100).toFixed(1),
+          },
+          'Approaching spending limit'
+        );
+      }
+      if (total > limit) {
+        throw new Error(`Cumulative spending ${total} exceeds limit ${limit}`);
+      }
+    }
+  }
+
+  /**
+   * Undo a previously recorded amount, used to roll back a spend that was
+   * recorded but whose transaction ultimately failed to submit (#646).
+   *
+   * Removes the most recent record matching `amountStr` within the active
+   * window and deletes it from persistence. Best-effort: a missing record is a
+   * no-op so callers can safely invoke this from a failure path.
+   */
+  rollback(amountStr: string): void {
+    const amount = parseFloat(amountStr);
+    if (isNaN(amount)) return;
+    const now = Date.now();
+    this.pruneOld(now);
+    for (let i = this.records.length - 1; i >= 0; i--) {
+      const rec = this.records[i];
+      if (rec && rec.amount === amount) {
+        this.records.splice(i, 1);
+        try {
+          pruneSpendingRecords(now - this.windowMs);
+        } catch {
+          // Persistence is best-effort; the in-memory window is authoritative.
+        }
+        return;
+      }
+    }
 
     const id = String(this.nextReservationId++);
     this.reservations.set(id, { amount, timestamp: now });
@@ -303,7 +357,7 @@ export class SpendingTracker {
       saveSpendingRecord(record);
     } catch (err) {
       // A spend that cannot be written down still counts in this process.
-      logger.warn('Could not persist spending record', { error: String(err) });
+      logger.warn({ error: String(err) }, 'Could not persist spending record');
     }
   }
 
