@@ -214,7 +214,8 @@ Every `TaskType` value accepted by `PayFiAgent.run()` is listed below, together 
 | `account_history` | `AccountHistoryTool` | Fetch paginated payment transaction history for a Stellar account. |
 | `set_options` | `SetOptionsTool` | Manage account flags, thresholds, signers, and home domain via Stellar `setOptions` operation. |
 | `soroban_event_query` | `SorobanEventIndexerTool` | Query historical Soroban contract events by ledger range and topic filters. Read-only. |
-| `stellar_identity_auth` | `StellarIdentityTool` | Perform SEP-0010 Web Auth challenge-response authentication with an anchor and obtain a JWT. |
+| `stellar_identity_auth` | `StellarIdentityTool` | Obtain an anchor JWT: SEP-0010 Web Auth for the agent account, or SEP-0045 Web Auth for a contract (`C…`) account, signing the contract's authorization entry through the `Signer`. |
+| `cross_border_payment` | `CrossBorderPaymentTool` | SEP-31 cross-border payment as the sending anchor (SEP-12 KYC, SEP-38 quote, SEP-31 transaction, on-chain payment with the anchor memo). |
 | `friendbot` | `FriendBotTool` | Request test account funding on testnet or futurenet via Friendbot. Not available on mainnet. |
 | `ledger_info` | `LedgerInfoTool` | Fetch the latest ledger sequence and protocol version from Soroban RPC. Cached for 6 seconds unless `forceRefresh: true`. Read-only. |
 | `network_status` | `NetworkStatusTool` | Check health and latency of the configured Horizon and Soroban RPC endpoints. Read-only. |
@@ -360,8 +361,9 @@ All tools live in `backend/tools/`. Each tool is a self-contained class responsi
 **Purpose:** Native XLM or custom asset payment via Horizon.
 
 Key design decisions:
-- Validates input with `PaymentInputSchema` (Zod) before touching the network. Amount must be a positive Stellar decimal (up to 7 decimal places); destination must be a 56-char G-address; memo capped at 28 bytes.
-- Rejects self-payments: the destination cannot equal the agent's own public key.
+- Validates input with `PaymentInputSchema` (Zod) before touching the network. Amount must be a positive Stellar decimal (up to 7 decimal places); destination may be a G-address, a muxed M-address, or a federation address (`name*domain.com`, resolved by `resolveDestination()` in `backend/utils/destination.ts` and cached for 5 minutes); memo capped at 28 bytes. A memo the federation server requires is attached automatically, and supplying a second memo is rejected.
+- Rejects self-payments: the destination (or a muxed address's base account) cannot equal the agent's own public key.
+- The fee is bid from Horizon `fee_stats` by `estimateFee()` (`backend/fees.ts`: p50/p90/p99 for low/medium/high priority, capped by `MAX_FEE_STROOPS`). A submission rejected with `tx_insufficient_fee` is resubmitted once inside a fee bump at the high estimate.
 - Non-XLM payments require an `assetIssuer`. The tool throws immediately if one is missing rather than producing an ambiguous network error.
 - **Simulation exemption:** Horizon has no simulation endpoint. The tool validates the transaction envelope locally, then signs and submits directly. There is no Soroban-style simulation pass on this path. See [The Mandatory Simulation Gate](#the-mandatory-simulation-gate) for why Soroban tools require simulation but Horizon tools do not.
 - Auto-retries once on `tx_bad_seq` by reloading the account's sequence number and rebuilding the transaction.
@@ -425,7 +427,8 @@ Key design decisions:
 
 Key design decisions:
 - `sendAmount` is the exact amount the agent sends. `destMinAmount` is the minimum the recipient must receive; the transaction fails on-chain if DEX slippage causes the output to fall below this floor.
-- `path` is an optional array of intermediate assets. If omitted, Horizon attempts to find a path automatically.
+- `path` is an optional array of intermediate assets. If `path` or `destMinAmount` is omitted, the tool queries Horizon's strict-send paths endpoint and uses the path that delivers the most; an omitted `destMinAmount` is that quote less `maxSlippageBps` (integer 0–1000, default 50 = 0.5%).
+- `destination` accepts the same G-, M- and federation forms as `StellarPaymentTool`.
 - **Simulation exemption:** Horizon-only, same rationale as `StellarPaymentTool`. Signs and submits directly.
 - Auto-retries once on `tx_bad_seq`, matching the pattern used by `StellarPaymentTool`.
 - Returns `{ txHash, ledger }` on success.
