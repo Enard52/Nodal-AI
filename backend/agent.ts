@@ -1525,6 +1525,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
         chain
       );
     } catch (err) {
+      failureAlerts.recordFailure(task.type);
       const durationMs = Date.now() - startMs;
       const safe = redactSecretString(describeError(err));
       const sanitized = sanitizePayload(task.payload);

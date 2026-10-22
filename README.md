@@ -646,10 +646,10 @@ The primary integration surface for developers. Dispatch tasks to the agent via 
 ### TaskType
 
 ```typescript
-type TaskType = "stellar_payment" | "soroban_invoke" | "x402_respond" | "path_payment" | "fee_bump" | "account_info"
+type TaskType = BuiltinTaskType | (string & Record<never, never>); // built-ins below, or a tool added with registerTool()
 ```
 
-Each value below is wired into `PayFiAgent.run()` in `backend/agent.ts`. Any unrecognised type throws `"Unknown task type: <value>"` immediately at dispatch time.
+Each value below is a `BuiltinTaskType` wired into `PayFiAgent.run()` in `backend/agent.ts` (`tests/docs_sync.test.ts` fails if this table drifts from it). Any unrecognised type throws `"Unknown task type: <value>"` immediately at dispatch time.
 
 | Value | Tool | Description |
 |-------|------|-------------|
@@ -659,13 +659,33 @@ Each value below is wired into `PayFiAgent.run()` in `backend/agent.ts`. Any unr
 | `path_payment` | `PathPaymentTool` | Cross-asset path payment (strict send) routed through the Stellar DEX. |
 | `fee_bump` | `FeeBumpTool` | Wrap an existing transaction in a fee-bump envelope for a sponsored retry. |
 | `account_info` | `AccountInfoTool` | Fetch the agent's account balances, sequence number, and trustlines from Horizon. |
+| `soroban_query` | `SorobanQueryTool` | Read-only Soroban contract state inspection. Always simulates, never broadcasts. |
+| `change_trust` | `TrustlineTool` | Add or remove a custom asset trustline on the agent's account. |
+| `multisig_payment` | `MultiSigPaymentTool` | Build M-of-N multisig payment transactions. Returns `unsignedXDR` until enough signatures are collected, then submits. |
+| `batch_payment` | `BatchPaymentTool` | Submit up to 100 payments in a single atomic transaction envelope. Aggregate spending limit enforced. |
+| `balance_check` | `BalanceCheckTool` | Query asset balances for any Stellar account (not just the agent). Read-only. |
+| `dex_offer` | `DexOfferTool` | Create, update, or delete a manage-sell offer on the Stellar DEX. |
+| `liquidity_pool` | `LiquidityPoolTool` | Interact with Stellar AMM liquidity pools (deposit, withdraw, query). |
+| `stellar_toml` | `StellarTomlTool` | Fetch and parse a domain's SEP-1 `stellar.toml`. |
+| `data_entry` | `DataEntryTool` | Set, delete, or read key-value data entries on an account. |
+| `sequence_number` | `SequenceNumberTool` | Fetch or bump the agent's current sequence number. |
+| `sponsored_account` | `SponsoredAccountTool` | Create a new Stellar account with sponsored reserves. |
+| `anchor_quote` | `AnchorQuoteTool` | Fetch an SEP-38 quote from an anchor for asset conversion. |
+| `inflation` | `InflationTool` | Set or query the account's inflation destination. |
+| `soroban_deploy` | `SorobanDeployTool` | Upload WASM bytecode and instantiate Soroban smart contracts. |
+| `swap` | `SwapTool` | Perform atomic DEX asset swaps via strict-send path payments, with a slippage bound. |
+| `account_history` | `AccountHistoryTool` | Fetch paginated payment history for a Stellar account. Read-only. |
+| `set_options` | `SetOptionsTool` | Manage account flags, thresholds, signers, and home domain via the `setOptions` operation. |
+| `soroban_event_query` | `SorobanEventIndexerTool` | Query historical Soroban contract events by ledger range and topic filters. Read-only. |
+| `stellar_identity_auth` | `StellarIdentityTool` | Perform SEP-10 Web Auth challenge-response authentication with an anchor and obtain a JWT. |
+| `friendbot` | `FriendBotTool` | Request test account funding on testnet or futurenet via Friendbot. Not available on mainnet. |
 | `ledger_info` | `LedgerInfoTool` | Fetch the latest ledger sequence and protocol version from Soroban RPC. Cached for 6 seconds unless `forceRefresh: true`. Read-only. |
 | `network_status` | `NetworkStatusTool` | Check health and latency of the configured Horizon and Soroban RPC endpoints. Read-only. |
 | `offer_book` | `OfferBookTool` | Query the Stellar DEX order book for an asset pair and return bids, asks, and the top-of-book spread. Read-only. |
 | `cross_border_payment` | `CrossBorderPaymentTool` | SEP-31 payment as the sending anchor: SEP-12 KYC for sender and receiver, optional SEP-38 firm quote, SEP-31 transaction, then the on-chain payment with the anchor's memo. Spending limit enforced. |
 | `soroban_storage` | `SorobanStorageTool` | Read a Soroban contract's storage entry (`persistent`, `temporary`, or `instance`) and return the decoded value. Read-only. |
 
-> **Standalone utilities:** `BalanceCheckTool` (`backend/tools/BalanceCheckTool.ts`) and `SorobanQueryTool` (`backend/tools/SorobanQueryTool.ts`) are importable directly and are not dispatched through `PayFiAgent.run()`. Use them outside the agent task loop when you only need a read-only query.
+> **Standalone use:** read-only tools such as `BalanceCheckTool` (`backend/tools/BalanceCheckTool.ts`) and `SorobanQueryTool` (`backend/tools/SorobanQueryTool.ts`) can also be imported and used directly, outside the agent task loop, when you only need a query.
 
 ### AgentTask
 

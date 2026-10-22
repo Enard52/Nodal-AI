@@ -117,6 +117,7 @@ export class SpendingTracker {
   private _reserving = false;
 import { config } from './config';
 import { logger } from './logger';
+import { spendingAlerts } from './alerts';
 import {
   clearSpendingRecords,
   loadSpendingRecords,
@@ -125,9 +126,18 @@ import {
 } from './persistence';
 
 /**
- * Simple in‑memory spending tracker that records each payment amount and
- * maintains a rolling time window. It is used by the agent to enforce a
- * cumulative spending limit within `config.SPENDING_WINDOW_MS`.
+ * Spending tracker that records each payment amount and maintains a rolling
+ * time window. It is used by the agent to enforce a cumulative spending limit
+ * within `config.SPENDING_WINDOW_MS`.
+ *
+ * The window is mirrored to SQLite (#372). Holding it only in memory meant a
+ * restart reset the cumulative total to zero, so an agent that was restarted —
+ * or that crashed and was restarted for it — could spend past its cap by
+ * starting over with a clean slate. Records are reloaded on construction and
+ * written on every `record()` / `commit()`.
+ *
+ * Persistence is best-effort: if the database is unavailable the tracker still
+ * enforces the limit for the life of the process rather than refusing to run.
  *
  * ## Record semantics (issue #730)
  * `record()` computes the prospective total *before* mutating state. If adding
@@ -149,6 +159,11 @@ import {
  *
  * A reservation that is neither committed nor released keeps the amount
  * reserved inside the current window (conservative-safe behaviour on crash).
+ *
+ * ## Alerts (issue #824)
+ * Every accepted or rejected spend is checked against the configured alert
+ * thresholds (80% and 100% of the limit by default). Each threshold notifies
+ * once per window — see {@link alerts!SpendingAlertMonitor}.
  */
 export class SpendingTracker {
   private readonly windowMs: number;
@@ -157,22 +172,6 @@ export class SpendingTracker {
   // Provisional holds – reserved but not yet committed or released (issue #729)
   private reservations: Map<string, { amount: number; timestamp: number }> = new Map();
   private nextReservationId = 0;
- * Spending tracker that records each payment amount and maintains a rolling
- * time window. It is used by the agent to enforce a cumulative spending limit
- * within `config.SPENDING_WINDOW_MS`.
- *
- * The window is mirrored to SQLite (#372). Holding it only in memory meant a
- * restart reset the cumulative total to zero, so an agent that was restarted —
- * or that crashed and was restarted for it — could spend past its cap by
- * starting over with a clean slate. Records are reloaded on construction and
- * written on every `record()`.
- *
- * Persistence is best-effort: if the database is unavailable the tracker still
- * enforces the limit for the life of the process rather than refusing to run.
- */
-export class SpendingTracker {
-  private readonly windowMs: number;
-  private records: { amount: number; timestamp: number }[] = [];
 
   constructor(windowMs: number = config.SPENDING_WINDOW_MS) {
     this.windowMs = windowMs;
@@ -321,17 +320,15 @@ export class SpendingTracker {
    * Record a payment amount immediately (no reserve/commit needed).
    * The amount is expected to be a numeric string.
    *
-   * **Fix for #730**: the prospective total is computed *before* the record is
-   * pushed. If it would exceed the limit the method throws without mutating
-   * state — a rejected call leaves `total()` unchanged.
-   *
-   * @throws if the new cumulative total would exceed `config.AGENT_SPENDING_LIMIT`.
-   * Record a payment amount. The amount is expected to be a numeric string.
-   * Throws if the new cumulative total exceeds `config.AGENT_SPENDING_LIMIT`.
+   * The prospective total is computed *before* the record is pushed. If it
+   * would exceed the limit the method throws without mutating state — a
+   * rejected call leaves `total()` unchanged.
    *
    * Callers must only invoke this once a transfer has actually been submitted
    * successfully — recording before submission permanently counts a spend that
    * may never have happened (see #646).
+   *
+   * @throws if the new cumulative total would exceed `config.AGENT_SPENDING_LIMIT`.
    */
   record(amountStr: string): void {
     const amount = parseFloat(amountStr);
@@ -339,15 +336,34 @@ export class SpendingTracker {
     const now = Date.now();
     this.pruneOld(now);
 
-    // ── #730 fix: check BEFORE mutating ──────────────────────────────────────
-    const prospective = this.sumCommitted() + this.sumReserved() + amount;
-    const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-    if (!isNaN(prospective) && !isNaN(limit) && prospective > limit) {
-      // Throw without pushing — rejected amount never enters state
-      throw new Error(`Cumulative spending ${prospective} exceeds limit ${limit}`);
-    }
+    this.assertWithinLimit(amount);
 
-    this.records.push({ amount, timestamp: now });
+    const record = { amount, timestamp: now };
+    this.records.push(record);
+    this.persist(record);
+    this.checkAlerts(this.calculateTotal() + this.sumReserved());
+  }
+
+  /**
+   * Undo a previously recorded amount, used to roll back a spend that was
+   * recorded but whose transaction ultimately failed to submit (#646).
+   *
+   * Removes the most recent record matching `amountStr` within the active
+   * window. Best-effort: a missing record is a no-op so callers can safely
+   * invoke this from a failure path.
+   */
+  rollback(amountStr: string): void {
+    const amount = parseFloat(amountStr);
+    if (isNaN(amount)) return;
+    const now = Date.now();
+    this.pruneOld(now);
+    for (let i = this.records.length - 1; i >= 0; i--) {
+      const rec = this.records[i];
+      if (rec && rec.amount === amount) {
+        this.records.splice(i, 1);
+        return;
+      }
+    }
   }
 
   // ─── Issue #729: reserve / commit / release ───────────────────────────────
@@ -502,7 +518,10 @@ export class SpendingTracker {
     this.reservations.delete(id);
     // Preserve the original reservation timestamp so the window boundary is
     // calculated relative to when the payment was authorised, not submitted.
-    this.records.push({ amount: reservation.amount, timestamp: reservation.timestamp });
+    const record = { amount: reservation.amount, timestamp: reservation.timestamp };
+    this.records.push(record);
+    this.persist(record);
+    this.checkAlerts(this.calculateTotal() + this.sumReserved());
   }
 
   /**
@@ -524,21 +543,14 @@ export class SpendingTracker {
   total(): number {
     const now = Date.now();
     this.pruneOld(now);
-    return this.sumCommitted();
+    return this.calculateTotal();
   }
 
   /** Return the total of committed + reserved amounts within the current window. */
   totalWithReserved(): number {
     const now = Date.now();
     this.pruneOld(now);
-    return this.sumCommitted() + this.sumReserved();
-  }
-
-  // ─── Internals ────────────────────────────────────────────────────────────
-
-  private sumCommitted(): number {
-    return this.records.reduce((sum, r) => sum + r.amount, 0);
-    return this.calculateTotal();
+    return this.calculateTotal() + this.sumReserved();
   }
 
   /**
@@ -566,6 +578,35 @@ export class SpendingTracker {
     };
   }
 
+  // ─── Internals ────────────────────────────────────────────────────────────
+
+  /**
+   * Throw — without mutating state — if adding `amount` would breach the limit.
+   * A rejected attempt still counts as the limit being hit for alerting.
+   */
+  private assertWithinLimit(amount: number): void {
+    const prospective = this.calculateTotal() + this.sumReserved() + amount;
+    const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+    if (!isNaN(prospective) && !isNaN(limit) && prospective > limit) {
+      this.checkAlerts(prospective);
+      throw new Error(`Cumulative spending ${prospective} exceeds limit ${limit}`);
+    }
+  }
+
+  /** Raise threshold alerts (80% / 100% by default) for the given window total. */
+  private checkAlerts(total: number): void {
+    const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+    if (isNaN(total) || isNaN(limit)) return;
+    if (total > limit * 0.8) {
+      logger.warn('Approaching spending limit', {
+        total,
+        limit,
+        percent: ((total / limit) * 100).toFixed(1),
+      });
+    }
+    spendingAlerts.check(total, limit, this.windowMs);
+  }
+
   /**
    * Calculate cumulative spending sum using BigInt stroop scaling (10_000_000n)
    * to avoid floating-point addition rounding error accumulation across records.
@@ -577,12 +618,21 @@ export class SpendingTracker {
       const [whole = '0', fraction = ''] = str.split('.');
       const wholeBig = BigInt(whole);
       const fracBig = BigInt(fraction.padEnd(7, '0').slice(0, 7));
-      const stroops = wholeBig < 0n || str.startsWith('-')
-        ? wholeBig * STROOP_SCALE - fracBig
-        : wholeBig * STROOP_SCALE + fracBig;
+      const stroops =
+        wholeBig < 0n || str.startsWith('-')
+          ? wholeBig * STROOP_SCALE - fracBig
+          : wholeBig * STROOP_SCALE + fracBig;
       return sum + stroops;
     }, 0n);
     return Number(totalStroops) / Number(STROOP_SCALE);
+  }
+
+  private sumReserved(): number {
+    let sum = 0;
+    for (const r of this.reservations.values()) {
+      sum += r.amount;
+    }
+    return sum;
   }
 
   private persist(record: { amount: number; timestamp: number }): void {
@@ -592,14 +642,6 @@ export class SpendingTracker {
       // A spend that cannot be written down still counts in this process.
       logger.warn({ error: String(err) }, 'Could not persist spending record');
     }
-  }
-
-  private sumReserved(): number {
-    let sum = 0;
-    for (const r of this.reservations.values()) {
-      sum += r.amount;
-    }
-    return sum;
   }
 
   private pruneOld(now: number): void {
@@ -621,14 +663,6 @@ export class SpendingTracker {
         this.reservations.delete(id);
       }
     }
-  }
-
-  /** Reset all state (committed records and reservations). */
-  clear(): void {
-    // Fix for #730: records was declared readonly, which caused a compile error
-    // when reassigning. Use splice/clear instead of reassignment.
-    this.records.splice(0);
-    this.reservations.clear();
     if (evicted) {
       try {
         pruneSpendingRecords(cutoff);
@@ -638,9 +672,11 @@ export class SpendingTracker {
     }
   }
 
-  clear() {
-    this.records.length = 0;
+  /** Reset all state (committed records, reservations and alert thresholds). */
+  clear(): void {
     this.records = [];
+    this.reservations.clear();
+    spendingAlerts.reset();
     try {
       clearSpendingRecords();
     } catch {
