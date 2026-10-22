@@ -724,6 +724,31 @@ export function pruneIdempotencyKeys(): number {
   return result.changes;
 }
 
+// ─── X402 rate limiter records ───────────────────────────────────────────────
+
+/** Save a timestamp record for an x402 payment. */
+export function saveX402RateRecord(timestamp: number): void {
+  getDb().prepare(`INSERT INTO x402_rate_records (timestamp) VALUES (?)`).run(timestamp);
+}
+
+/** Load timestamp records at or after `sinceMs`, oldest first. */
+export function loadX402RateRecords(sinceMs: number): number[] {
+  const rows = getDb()
+    .prepare(`SELECT timestamp FROM x402_rate_records WHERE timestamp >= ? ORDER BY timestamp ASC`)
+    .all(sinceMs) as Array<{ timestamp: number }>;
+  return rows.map((r) => r.timestamp);
+}
+
+/** Drop x402 rate records older than the cutoff. */
+export function pruneX402RateRecords(cutoffMs: number): void {
+  getDb().prepare(`DELETE FROM x402_rate_records WHERE timestamp < ?`).run(cutoffMs);
+}
+
+/** Drop all x402 rate records. */
+export function clearX402RateRecords(): void {
+  getDb().prepare(`DELETE FROM x402_rate_records`).run();
+}
+
 /** Replace the underlying DB instance — used in tests to inject an in-memory DB. */
 export function _setDb(db: Database.Database | null): void {
   _db = db;
