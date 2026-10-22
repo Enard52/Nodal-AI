@@ -1,7 +1,12 @@
 /**
  * backend/persistence.ts
  *
- * SQLite-backed audit log for every AgentResult produced by PayFiAgent.run().
+ * SQLite-backed persistence for:
+ *   1. AgentResult audit log  (agent_results table)
+ *   2. SpendingTracker records (spending_records table) — used for rollback-safe
+ *      persistence so that rolled-back reservations are not re-loaded after a
+ *      process restart.
+ *
  * The DB path is configured via DB_PATH (default: ./agent.db).
  * Pass ":memory:" for in-process testing via _setDb().
  */
@@ -13,8 +18,27 @@ import { migrateSqlite } from './db/migrate';
 
 export type PersistedResult = AgentResult & { timestamp: string };
 
+/** A row in the spending_records table. */
+export interface SpendingRecord {
+  /** Unique reservation id — passed through from SpendingTracker.reserve(). */
+  readonly id: string;
+  /** ISO-8601 timestamp of when the reservation was created. */
+  readonly timestamp: string;
+  /** Amount as a canonical 7-decimal-place string (e.g. "100.0000000"). */
+  readonly amount: string;
+  /** Asset key: "XLM" for native, "CODE:ISSUER" for credit assets. */
+  readonly assetKey: string;
+}
+
 let _db: Database.Database | null = null;
 
+function getDb(): Database.Database {
+  if (!_db) {
+    // Lazy import of config so that tests can inject via _setDb() before any DB access
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { config } = require("./config") as typeof import("./config");
+    _db = new Database(config.DB_PATH);
+    initSchema(_db);
 /**
  * Bring the schema up to date by applying the numbered migrations in
  * `backend/db/migrations/` (#821).
@@ -141,6 +165,28 @@ export function getDb(): Database.Database {
   return _db;
 }
 
+/** Create tables if they don't exist. Called once on first DB open. */
+function initSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_results (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT    NOT NULL,
+      taskType  TEXT    NOT NULL,
+      success   INTEGER NOT NULL,
+      data      TEXT,
+      error     TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS spending_records (
+      id        TEXT    PRIMARY KEY,
+      timestamp TEXT    NOT NULL,
+      amount    TEXT    NOT NULL,
+      assetKey  TEXT    NOT NULL
+    );
+  `);
+}
+
+// ─── agent_results ────────────────────────────────────────────────────────────
 /**
  * Close the live connection and drop the cached handle (#644).
  *
@@ -681,6 +727,8 @@ export function pruneIdempotencyKeys(): number {
 /** Replace the underlying DB instance — used in tests to inject an in-memory DB. */
 export function _setDb(db: Database.Database | null): void {
   _db = db;
+  // Ensure schema exists on the injected DB as well
+  initSchema(db);
   if (_db) {
     applySchema(_db);
   }
